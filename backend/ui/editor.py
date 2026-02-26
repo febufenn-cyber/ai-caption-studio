@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from typing import Callable
 
+
 def _resolve_pyqt_plugins_path() -> Path | None:
     spec = importlib.util.find_spec("PyQt6")
     if spec is None or spec.origin is None:
@@ -21,6 +22,13 @@ def _resolve_pyqt_plugins_path() -> Path | None:
 
 
 def _configure_qt_runtime_environment() -> None:
+    logging_rules = os.environ.get("QT_LOGGING_RULES", "")
+    if "qt.qpa.fonts.warning" not in logging_rules:
+        if logging_rules:
+            os.environ["QT_LOGGING_RULES"] = f"{logging_rules};qt.qpa.fonts.warning=false"
+        else:
+            os.environ["QT_LOGGING_RULES"] = "qt.qpa.fonts.warning=false"
+
     if sys.platform != "darwin":
         return
 
@@ -45,33 +53,43 @@ _configure_qt_runtime_environment()
 
 
 from PyQt6.QtCore import QLibraryInfo, QPointF, QRectF, Qt, QUrl, pyqtSignal
-from PyQt6.QtGui import QAction, QBrush, QColor, QPen
+from PyQt6.QtGui import QAction, QBrush, QColor, QFont, QPen
 from PyQt6.QtMultimedia import QAudioOutput, QMediaFormat, QMediaPlayer
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtWidgets import (
     QApplication,
+    QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
     QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsTextItem,
     QGraphicsView,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressDialog,
     QPushButton,
+    QSplitter,
+    QStackedLayout,
     QStyle,
     QToolBar,
     QVBoxLayout,
     QWidget,
-    QComboBox,
 )
 
+from backend.caption_segment import CaptionSegment
 from backend.subtitles.ass_writer import write_ass
+from backend.subtitles.lyric_sync import LyricSyncError, parse_lyrics_lines, sync_segments_to_lyrics
 from backend.subtitles.srt_parser import parse_srt_file
 from backend.subtitles.srt_writer import write_srt
-from backend.caption_segment import CaptionSegment
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -94,7 +112,7 @@ def _multimedia_troubleshooting_message(error_detail: str | None = None) -> str:
             "1) Recreate the venv with Python 3.10+ using ./scripts/setup.sh",
             "2) Remove conflicting shell vars: QT_PLUGIN_PATH and QT_QPA_PLATFORM_PLUGIN_PATH",
             "3) On macOS, use the native backend: export QT_MEDIA_BACKEND=darwin",
-            "4) If you force ffmpeg backend, install matching FFmpeg 7 libraries: brew install ffmpeg@7",
+            "4) For caption burn-in export on macOS, install ffmpeg-full and set FFMPEG_BIN",
         ]
     )
     return "\n".join(lines)
@@ -193,12 +211,27 @@ def _resolve_ffmpeg_for_subtitle_burnin() -> tuple[str | None, str | None]:
     return None, message
 
 
+def _format_time(seconds: float) -> str:
+    total_ms = max(0, int(round(seconds * 1000)))
+    h, rem = divmod(total_ms, 3_600_000)
+    m, rem = divmod(rem, 60_000)
+    s, ms = divmod(rem, 1000)
+    return f"{h:02}:{m:02}:{s:02}.{ms:03}"
+
+
+def _segment_at_time(segments: list[CaptionSegment], seconds: float) -> CaptionSegment | None:
+    for segment in segments:
+        if segment.start <= seconds <= segment.end:
+            return segment
+    return None
+
+
 class EditableCaptionTextItem(QGraphicsTextItem):
     def __init__(self, text: str, on_commit: Callable[[str], None], parent=None) -> None:
         super().__init__(text, parent)
         self._on_commit = on_commit
         self.setTextInteractionFlags(Qt.TextInteractionFlag.TextEditorInteraction)
-        self.setDefaultTextColor(QColor("#102A43"))
+        self.setDefaultTextColor(QColor("#E6EDF8"))
 
     def focusOutEvent(self, event) -> None:  # type: ignore[override]
         self._on_commit(self.toPlainText().strip())
@@ -223,8 +256,9 @@ class CaptionBlock(QGraphicsRectItem):
         self._on_segment_updated = on_segment_updated
         self._on_segment_selected = on_segment_selected
 
-        self.setBrush(QBrush(QColor("#5DADE2")))
-        self.setPen(QPen(QColor("#1B4F72"), 1.2))
+        self._active = False
+        self._set_colors()
+
         self.setFlags(
             QGraphicsRectItem.GraphicsItemFlag.ItemIsSelectable
             | QGraphicsRectItem.GraphicsItemFlag.ItemIsFocusable
@@ -238,6 +272,18 @@ class CaptionBlock(QGraphicsRectItem):
         self.label = EditableCaptionTextItem(self.segment.text, self._commit_text, self)
         self.refresh_from_segment()
 
+    def _set_colors(self) -> None:
+        if self._active:
+            self.setBrush(QBrush(QColor("#2AA198")))
+            self.setPen(QPen(QColor("#78F0D8"), 1.5))
+            return
+        self.setBrush(QBrush(QColor("#2E3A59")))
+        self.setPen(QPen(QColor("#5A6D99"), 1.2))
+
+    def set_active(self, active: bool) -> None:
+        self._active = active
+        self._set_colors()
+
     @property
     def duration(self) -> float:
         return max(0.1, self.segment.end - self.segment.start)
@@ -247,7 +293,7 @@ class CaptionBlock(QGraphicsRectItem):
         self.setRect(0, 0, max(self.MIN_WIDTH, self.duration * self.pixels_per_second), 56)
         self.label.setPlainText(self.segment.text)
         self.label.setPos(8, 14)
-        self.label.setTextWidth(self.rect().width() - 14)
+        self.label.setTextWidth(max(10.0, self.rect().width() - 14))
 
     def _handle_at(self, pos: QPointF) -> str:
         if pos.x() <= self.LEFT_HANDLE:
@@ -261,7 +307,7 @@ class CaptionBlock(QGraphicsRectItem):
         end = start + max(0.1, self.rect().width() / self.pixels_per_second)
         self.segment.start = round(start, 3)
         self.segment.end = round(end, 3)
-        self.label.setTextWidth(self.rect().width() - 14)
+        self.label.setTextWidth(max(10.0, self.rect().width() - 14))
         self._on_segment_updated(self.segment)
 
     def _commit_text(self, text: str) -> None:
@@ -315,11 +361,13 @@ class TimelineView(QGraphicsView):
         self.setScene(self.scene)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setFixedHeight(120)
+        self.setFixedHeight(128)
         self.pixels_per_second = pixels_per_second
+        self._blocks: list[CaptionBlock] = []
 
     def load_segments(self, segments: list[CaptionSegment]) -> None:
         self.scene.clear()
+        self._blocks.clear()
         max_end = 30.0
 
         for segment in segments:
@@ -329,26 +377,104 @@ class TimelineView(QGraphicsView):
                 on_segment_updated=self.segment_edited.emit,
                 on_segment_selected=self.segment_selected.emit,
             )
+            self._blocks.append(block)
             self.scene.addItem(block)
             max_end = max(max_end, segment.end)
 
         self.scene.setSceneRect(0, 0, max_end * self.pixels_per_second + 280, 100)
 
+    def set_active_segment(self, segment: CaptionSegment | None) -> None:
+        for block in self._blocks:
+            block.set_active(block.segment is segment)
+
 
 class CaptionEditorWindow(QMainWindow):
-    def __init__(self, video_path: Path, srt_path: Path) -> None:
+    def __init__(self, video_path: Path, srt_path: Path | None = None) -> None:
         super().__init__()
         self.video_path = video_path
-        self.srt_path = srt_path
-        self.segments = parse_srt_file(self.srt_path)
+        self.srt_path = srt_path or self._default_srt_path_for_video(video_path)
+        self.segments = parse_srt_file(self.srt_path) if self.srt_path.exists() else []
         self.selected_segment: CaptionSegment | None = None
+        self._active_segment: CaptionSegment | None = None
         self._playback_error_reported = False
+        self._syncing_ui = False
 
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-        self.setWindowTitle("Offline AI Caption Studio - Caption Editor")
-        self.resize(1280, 760)
+        self._apply_styles()
+        self._build_ui()
+        self._set_video_source(self.video_path)
+        self._sort_segments()
+        self._refresh_timeline_and_list()
+        self._update_caption_overlay(0.0)
+        self._set_window_title()
+
+    @staticmethod
+    def _default_srt_path_for_video(video_path: Path) -> Path:
+        return OUTPUT_DIR / f"{video_path.stem}.srt"
+
+    def _apply_styles(self) -> None:
+        self.setStyleSheet(
+            """
+            QMainWindow, QWidget {
+                background-color: #0f1218;
+                color: #ebeff8;
+                font-family: 'Helvetica Neue', 'Segoe UI', 'Noto Sans', sans-serif;
+                font-size: 13px;
+            }
+            QToolBar {
+                background: #151a22;
+                border: none;
+                spacing: 8px;
+                padding: 6px;
+            }
+            QPushButton {
+                background-color: #1d2430;
+                border: 1px solid #2f3849;
+                border-radius: 8px;
+                padding: 6px 12px;
+            }
+            QPushButton:hover {
+                background-color: #263246;
+            }
+            QPushButton:pressed {
+                background-color: #18202f;
+            }
+            QComboBox, QLineEdit, QDoubleSpinBox, QPlainTextEdit, QListWidget {
+                background-color: #141923;
+                border: 1px solid #2b3445;
+                border-radius: 8px;
+                padding: 5px;
+                selection-background-color: #245f8a;
+            }
+            QGroupBox {
+                border: 1px solid #2b3445;
+                border-radius: 10px;
+                margin-top: 12px;
+                font-weight: 600;
+                color: #a9b6cf;
+            }
+            QGroupBox::title {
+                left: 10px;
+                padding: 0 5px 0 5px;
+            }
+            QLabel#captionOverlay {
+                background-color: rgba(0, 0, 0, 165);
+                border-radius: 12px;
+                color: #f3f7ff;
+                font-size: 20px;
+                font-weight: 700;
+                padding: 10px 14px;
+            }
+            QLabel#hintText {
+                color: #8fa0c0;
+            }
+            """
+        )
+
+    def _build_ui(self) -> None:
+        self.resize(1500, 900)
 
         self.media_player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
@@ -356,18 +482,58 @@ class CaptionEditorWindow(QMainWindow):
 
         self.video_widget = QVideoWidget(self)
         self.media_player.setVideoOutput(self.video_widget)
-        self.media_player.setSource(QUrl.fromLocalFile(str(self.video_path)))
+
+        self.caption_overlay = QLabel("")
+        self.caption_overlay.setObjectName("captionOverlay")
+        self.caption_overlay.setWordWrap(True)
+        self.caption_overlay.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
+
+        overlay_layer = QWidget()
+        overlay_layer.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        overlay_layer.setStyleSheet("background: transparent;")
+        overlay_layout = QVBoxLayout(overlay_layer)
+        overlay_layout.setContentsMargins(36, 28, 36, 26)
+        overlay_layout.addStretch(1)
+        overlay_layout.addWidget(self.caption_overlay)
+
+        video_stack = QStackedLayout()
+        video_stack.setStackingMode(QStackedLayout.StackingMode.StackAll)
+        video_stack.addWidget(self.video_widget)
+        video_stack.addWidget(overlay_layer)
+
+        video_panel = QWidget()
+        video_panel.setLayout(video_stack)
 
         self.timeline = TimelineView()
-        self.timeline.load_segments(self.segments)
         self.timeline.segment_selected.connect(self.on_segment_selected)
         self.timeline.segment_edited.connect(self.on_segment_edited)
 
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(12)
+        left_layout.addWidget(video_panel, stretch=5)
+        left_layout.addWidget(self.timeline, stretch=1)
+
+        right_panel = self._build_right_panel()
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(left_panel)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 4)
+        splitter.setStretchFactor(1, 2)
+
         self.position_label = QLabel("00:00:00.000")
         self.range_label = QLabel("No caption selected")
+        self.range_label.setObjectName("hintText")
 
         self.format_combo = QComboBox()
         self.format_combo.addItems(["srt", "ass"])
+
+        play_btn = QPushButton(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay), "Play")
+        play_btn.clicked.connect(self.media_player.play)
+        pause_btn = QPushButton(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause), "Pause")
+        pause_btn.clicked.connect(self.media_player.pause)
 
         save_btn = QPushButton("Save SRT")
         save_btn.clicked.connect(self.save_srt)
@@ -376,15 +542,12 @@ class CaptionEditorWindow(QMainWindow):
         export_btn.clicked.connect(self.export_captioned_video)
 
         controls_bar = QHBoxLayout()
-        play_btn = QPushButton(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay), "Play")
-        play_btn.clicked.connect(self.media_player.play)
-        pause_btn = QPushButton(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause), "Pause")
-        pause_btn.clicked.connect(self.media_player.pause)
         controls_bar.addWidget(play_btn)
         controls_bar.addWidget(pause_btn)
+        controls_bar.addSpacing(8)
         controls_bar.addWidget(QLabel("Current:"))
         controls_bar.addWidget(self.position_label)
-        controls_bar.addSpacing(20)
+        controls_bar.addSpacing(16)
         controls_bar.addWidget(self.range_label)
         controls_bar.addStretch(1)
         controls_bar.addWidget(QLabel("Subtitle Format:"))
@@ -394,27 +557,221 @@ class CaptionEditorWindow(QMainWindow):
 
         body = QWidget()
         layout = QVBoxLayout(body)
-        layout.addWidget(self.video_widget, stretch=3)
-        layout.addWidget(self.timeline, stretch=1)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
+        layout.addWidget(splitter, stretch=1)
         layout.addLayout(controls_bar)
         self.setCentralWidget(body)
 
-        self.media_player.positionChanged.connect(self._update_position_label)
+        self.media_player.positionChanged.connect(self._on_media_position_changed)
         self.media_player.errorOccurred.connect(self._on_media_error)
 
-        open_action = QAction("Open SRT", self)
-        open_action.triggered.connect(self.open_srt)
+        open_video_action = QAction("Open Video", self)
+        open_video_action.triggered.connect(self.open_video)
+
+        open_srt_action = QAction("Open SRT", self)
+        open_srt_action.triggered.connect(self.open_srt)
+
+        generate_action = QAction("Auto-Generate Captions", self)
+        generate_action.triggered.connect(self.generate_captions_from_video)
+
         toolbar = QToolBar("Main")
-        toolbar.addAction(open_action)
+        toolbar.addAction(open_video_action)
+        toolbar.addAction(open_srt_action)
+        toolbar.addAction(generate_action)
         self.addToolBar(toolbar)
+
+    def _build_right_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(4, 0, 0, 0)
+        layout.setSpacing(10)
+
+        headline = QLabel("Caption Workspace")
+        headline.setStyleSheet("font-size: 18px; font-weight: 700;")
+        subtitle = QLabel("Edit timings, rewrite lines, and sync pasted lyrics instantly.")
+        subtitle.setObjectName("hintText")
+        subtitle.setWordWrap(True)
+        layout.addWidget(headline)
+        layout.addWidget(subtitle)
+
+        self.caption_list = QListWidget()
+        self.caption_list.currentRowChanged.connect(self._on_caption_row_changed)
+
+        captions_group = QGroupBox("Caption Timeline List")
+        captions_layout = QVBoxLayout(captions_group)
+        captions_layout.addWidget(self.caption_list)
+        layout.addWidget(captions_group, stretch=2)
+
+        edit_group = QGroupBox("Selected Caption")
+        edit_layout = QVBoxLayout(edit_group)
+
+        form = QFormLayout()
+        self.start_spin = QDoubleSpinBox()
+        self.start_spin.setRange(0.0, 99999.0)
+        self.start_spin.setDecimals(3)
+        self.start_spin.setSingleStep(0.05)
+
+        self.end_spin = QDoubleSpinBox()
+        self.end_spin.setRange(0.1, 99999.0)
+        self.end_spin.setDecimals(3)
+        self.end_spin.setSingleStep(0.05)
+
+        self.text_input = QPlainTextEdit()
+        self.text_input.setFixedHeight(84)
+
+        form.addRow("Start (s)", self.start_spin)
+        form.addRow("End (s)", self.end_spin)
+        form.addRow("Text", self.text_input)
+        edit_layout.addLayout(form)
+
+        edit_btn_row = QHBoxLayout()
+        apply_btn = QPushButton("Apply Edit")
+        apply_btn.clicked.connect(self.apply_selected_caption_edit)
+
+        add_btn = QPushButton("Add At Playhead")
+        add_btn.clicked.connect(self.add_caption_at_playhead)
+
+        delete_btn = QPushButton("Delete")
+        delete_btn.clicked.connect(self.delete_selected_caption)
+
+        edit_btn_row.addWidget(apply_btn)
+        edit_btn_row.addWidget(add_btn)
+        edit_btn_row.addWidget(delete_btn)
+        edit_layout.addLayout(edit_btn_row)
+
+        layout.addWidget(edit_group, stretch=2)
+
+        generation_group = QGroupBox("Auto Captions")
+        generation_layout = QVBoxLayout(generation_group)
+        generation_form = QFormLayout()
+
+        self.model_combo = QComboBox()
+        self.model_combo.addItems(["tiny", "base", "small", "medium", "large-v3"])
+        self.model_combo.setCurrentText("small")
+
+        self.language_input = QLineEdit()
+        self.language_input.setPlaceholderText("Optional: en, ta, es ...")
+
+        generation_form.addRow("Model", self.model_combo)
+        generation_form.addRow("Language", self.language_input)
+        generation_layout.addLayout(generation_form)
+
+        generate_btn = QPushButton("Auto-Generate From Video")
+        generate_btn.clicked.connect(self.generate_captions_from_video)
+        generation_layout.addWidget(generate_btn)
+
+        layout.addWidget(generation_group, stretch=1)
+
+        lyrics_group = QGroupBox("Lyrics Sync")
+        lyrics_layout = QVBoxLayout(lyrics_group)
+        self.lyrics_input = QPlainTextEdit()
+        self.lyrics_input.setPlaceholderText("Paste lyric lines here, one line per row...")
+        self.lyrics_input.setFixedHeight(140)
+
+        self.similarity_spin = QDoubleSpinBox()
+        self.similarity_spin.setRange(0.05, 0.95)
+        self.similarity_spin.setSingleStep(0.05)
+        self.similarity_spin.setDecimals(2)
+        self.similarity_spin.setValue(0.25)
+
+        similarity_form = QFormLayout()
+        similarity_form.addRow("Match Similarity", self.similarity_spin)
+
+        sync_btn = QPushButton("Sync Pasted Lyrics To Captions")
+        sync_btn.clicked.connect(self.sync_lyrics_to_segments)
+
+        lyrics_layout.addWidget(self.lyrics_input)
+        lyrics_layout.addLayout(similarity_form)
+        lyrics_layout.addWidget(sync_btn)
+
+        layout.addWidget(lyrics_group, stretch=2)
+        layout.addStretch(1)
+        return panel
+
+    def _set_window_title(self) -> None:
+        self.setWindowTitle(f"Offline AI Caption Studio - {self.video_path.name}")
+
+    def _set_video_source(self, video_path: Path) -> None:
+        self.media_player.stop()
+        self.media_player.setSource(QUrl.fromLocalFile(str(video_path)))
+        self.video_path = video_path
+
+    def _sort_segments(self) -> None:
+        self.segments.sort(key=lambda seg: (seg.start, seg.end))
+
+    def _segment_index(self, segment: CaptionSegment | None) -> int:
+        if segment is None:
+            return -1
+        for idx, existing in enumerate(self.segments):
+            if existing is segment:
+                return idx
+        return -1
+
+    def _caption_list_text(self, segment: CaptionSegment) -> str:
+        return f"{_format_time(segment.start)} → {_format_time(segment.end)}    {segment.text}"
+
+    def _refresh_timeline_and_list(self, preserve_selection: CaptionSegment | None = None) -> None:
+        if preserve_selection is not None and self._segment_index(preserve_selection) == -1:
+            preserve_selection = None
+
+        self.timeline.load_segments(self.segments)
+
+        self._syncing_ui = True
+        self.caption_list.clear()
+        for segment in self.segments:
+            item = QListWidgetItem(self._caption_list_text(segment))
+            self.caption_list.addItem(item)
+        self._syncing_ui = False
+
+        if preserve_selection is not None:
+            self._select_segment(preserve_selection, seek=False, scroll=True)
+        elif self.segments:
+            self._select_segment(self.segments[0], seek=False, scroll=False)
+        else:
+            self.selected_segment = None
+            self.timeline.set_active_segment(self._active_segment)
+            self._update_range_label(None)
+            self._load_selected_caption_into_form(None)
+
+    def _load_selected_caption_into_form(self, segment: CaptionSegment | None) -> None:
+        self._syncing_ui = True
+        if segment is None:
+            self.start_spin.setValue(0.0)
+            self.end_spin.setValue(0.0)
+            self.text_input.setPlainText("")
+        else:
+            self.start_spin.setValue(segment.start)
+            self.end_spin.setValue(segment.end)
+            self.text_input.setPlainText(segment.text)
+        self._syncing_ui = False
+
+    def _select_segment(self, segment: CaptionSegment, *, seek: bool, scroll: bool) -> None:
+        idx = self._segment_index(segment)
+        if idx < 0:
+            return
+
+        self.selected_segment = segment
+        self._update_range_label(segment)
+
+        self._syncing_ui = True
+        self.caption_list.setCurrentRow(idx)
+        self._syncing_ui = False
+
+        self.timeline.set_active_segment(self._active_segment or segment)
+        self._load_selected_caption_into_form(segment)
+
+        if seek:
+            self.media_player.setPosition(int(segment.start * 1000))
+
+        if scroll:
+            item = self.caption_list.item(idx)
+            if item is not None:
+                self.caption_list.scrollToItem(item)
 
     def _update_position_label(self, ms: int) -> None:
         seconds = ms / 1000
-        h = int(seconds // 3600)
-        m = int((seconds % 3600) // 60)
-        s = int(seconds % 60)
-        millis = int((seconds - int(seconds)) * 1000)
-        self.position_label.setText(f"{h:02}:{m:02}:{s:02}.{millis:03}")
+        self.position_label.setText(_format_time(seconds))
 
     def _update_range_label(self, segment: CaptionSegment | None) -> None:
         if segment is None:
@@ -422,14 +779,48 @@ class CaptionEditorWindow(QMainWindow):
             return
         self.range_label.setText(f"Selected: {segment.start:.3f}s → {segment.end:.3f}s")
 
+    def _update_caption_overlay(self, seconds: float) -> None:
+        active = _segment_at_time(self.segments, seconds)
+        self._active_segment = active
+        self.timeline.set_active_segment(active or self.selected_segment)
+
+        if active is None:
+            self.caption_overlay.setText("")
+            return
+
+        self.caption_overlay.setText(active.text)
+
+    def _on_media_position_changed(self, ms: int) -> None:
+        self._update_position_label(ms)
+        self._update_caption_overlay(ms / 1000)
+
     def on_segment_selected(self, segment: CaptionSegment) -> None:
-        self.selected_segment = segment
-        self.media_player.setPosition(int(segment.start * 1000))
-        self._update_range_label(segment)
+        self._select_segment(segment, seek=True, scroll=True)
 
     def on_segment_edited(self, segment: CaptionSegment) -> None:
-        self.selected_segment = segment
-        self._update_range_label(segment)
+        idx = self._segment_index(segment)
+        if idx >= 0:
+            item = self.caption_list.item(idx)
+            if item is not None:
+                item.setText(self._caption_list_text(segment))
+
+        if self.selected_segment is segment:
+            self._load_selected_caption_into_form(segment)
+            self._update_range_label(segment)
+
+        current_seconds = self.media_player.position() / 1000
+        self._update_caption_overlay(current_seconds)
+
+    def _on_caption_row_changed(self, row: int) -> None:
+        if self._syncing_ui:
+            return
+        if row < 0 or row >= len(self.segments):
+            self.selected_segment = None
+            self._update_range_label(None)
+            self._load_selected_caption_into_form(None)
+            return
+
+        self._select_segment(self.segments[row], seek=True, scroll=False)
 
     def _on_media_error(self, error: QMediaPlayer.Error, error_string: str) -> None:
         if error == QMediaPlayer.Error.NoError or self._playback_error_reported:
@@ -443,15 +834,105 @@ class CaptionEditorWindow(QMainWindow):
             _multimedia_troubleshooting_message(detail),
         )
 
+    def open_video(self) -> None:
+        path_str, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Video",
+            str(self.video_path.parent),
+            "Video Files (*.mp4 *.mov *.mkv *.avi *.m4v *.webm)",
+        )
+        if not path_str:
+            return
+
+        new_video = Path(path_str).resolve()
+        self._set_video_source(new_video)
+        self.srt_path = self._default_srt_path_for_video(new_video)
+
+        if self.srt_path.exists():
+            self.segments = parse_srt_file(self.srt_path)
+        else:
+            self.segments = []
+
+        self._sort_segments()
+        self._refresh_timeline_and_list()
+        self._set_window_title()
+
+    def open_srt(self) -> None:
+        path_str, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open SRT",
+            str(self.srt_path.parent),
+            "SRT (*.srt)",
+        )
+        if not path_str:
+            return
+
+        self.srt_path = Path(path_str).resolve()
+        self.segments = parse_srt_file(self.srt_path)
+        self._sort_segments()
+        self._refresh_timeline_and_list()
+
     def save_srt(self) -> None:
+        self._sort_segments()
         write_srt(self.segments, self.srt_path)
-        QMessageBox.information(self, "Saved", f"Saved captions to {self.srt_path}")
+        self._refresh_timeline_and_list(self.selected_segment)
+        QMessageBox.information(self, "Saved", f"Saved captions to:\n{self.srt_path}")
+
+    def apply_selected_caption_edit(self) -> None:
+        if self.selected_segment is None:
+            QMessageBox.warning(self, "No Selection", "Select a caption first.")
+            return
+
+        start = round(self.start_spin.value(), 3)
+        end = round(self.end_spin.value(), 3)
+        text = self.text_input.toPlainText().strip()
+
+        if end <= start:
+            QMessageBox.warning(self, "Invalid Range", "Caption end time must be greater than start time.")
+            return
+
+        if not text:
+            QMessageBox.warning(self, "Empty Text", "Caption text cannot be empty.")
+            return
+
+        self.selected_segment.start = start
+        self.selected_segment.end = end
+        self.selected_segment.text = text
+
+        self._sort_segments()
+        self._refresh_timeline_and_list(self.selected_segment)
+
+    def add_caption_at_playhead(self) -> None:
+        playhead = max(0.0, self.media_player.position() / 1000)
+        new_segment = CaptionSegment(
+            start=round(playhead, 3),
+            end=round(playhead + 2.0, 3),
+            text="New caption",
+        )
+        self.segments.append(new_segment)
+        self._sort_segments()
+        self._refresh_timeline_and_list(new_segment)
+
+    def delete_selected_caption(self) -> None:
+        if self.selected_segment is None:
+            QMessageBox.warning(self, "No Selection", "Select a caption first.")
+            return
+
+        idx = self._segment_index(self.selected_segment)
+        if idx < 0:
+            return
+
+        self.segments.pop(idx)
+        preserve = self.segments[min(idx, len(self.segments) - 1)] if self.segments else None
+        self.selected_segment = None
+        self._refresh_timeline_and_list(preserve)
 
     def _subtitle_export_path(self, fmt: str) -> Path:
         return TEMP_DIR / f"{self.video_path.stem}_edited.{fmt}"
 
     def _write_current_subtitle_file(self, fmt: str) -> Path:
         subtitle_path = self._subtitle_export_path(fmt)
+        self._sort_segments()
         if fmt == "ass":
             write_ass(self.segments, subtitle_path)
         else:
@@ -477,7 +958,7 @@ class CaptionEditorWindow(QMainWindow):
 
         duration = max((seg.end for seg in self.segments), default=0.0)
         if duration <= 0:
-            return 0.0
+            duration = max(0.1, self.media_player.duration() / 1000)
 
         return max(0.0, min(100.0, (out_time_ms / 1_000_000) / duration * 100))
 
@@ -544,39 +1025,148 @@ class CaptionEditorWindow(QMainWindow):
             f"Captioned video exported to:\n{output_video_path}",
         )
 
-    def open_srt(self) -> None:
-        path_str, _ = QFileDialog.getOpenFileName(self, "Open SRT", str(self.srt_path.parent), "SRT (*.srt)")
-        if not path_str:
+    def generate_captions_from_video(self) -> None:
+        model_size = self.model_combo.currentText().strip()
+        language = self.language_input.text().strip()
+
+        command = [
+            sys.executable,
+            "-m",
+            "backend.main",
+            str(self.video_path),
+            "--model-size",
+            model_size,
+        ]
+        if language:
+            command.extend(["--language", language])
+
+        progress = QProgressDialog(
+            "Generating captions with Whisper... first run may download model files.",
+            "Cancel",
+            0,
+            0,
+            self,
+        )
+        progress.setWindowTitle("Auto Caption Generation")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        while process.poll() is None:
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                process.terminate()
+                QMessageBox.warning(self, "Cancelled", "Caption generation was cancelled.")
+                return
+
+        stdout, stderr = process.communicate()
+        if process.returncode != 0:
+            QMessageBox.critical(
+                self,
+                "Caption Generation Failed",
+                f"Command: {' '.join(command)}\n\n{stderr.strip() or stdout.strip()}",
+            )
             return
-        self.srt_path = Path(path_str)
-        self.segments = parse_srt_file(self.srt_path)
-        self.selected_segment = None
-        self._update_range_label(None)
-        self.timeline.load_segments(self.segments)
+
+        generated_srt = OUTPUT_DIR / f"{self.video_path.stem}.srt"
+        if not generated_srt.exists():
+            QMessageBox.critical(
+                self,
+                "Caption Generation Failed",
+                "Caption generation finished, but no SRT output file was found.",
+            )
+            return
+
+        self.srt_path = generated_srt
+        self.segments = parse_srt_file(generated_srt)
+        self._sort_segments()
+        self._refresh_timeline_and_list()
+        QMessageBox.information(self, "Captions Ready", f"Generated captions loaded from:\n{generated_srt}")
+
+    def sync_lyrics_to_segments(self) -> None:
+        if not self.segments:
+            QMessageBox.warning(
+                self,
+                "No Captions",
+                "Generate or open captions before running lyric synchronization.",
+            )
+            return
+
+        raw_lyrics = self.lyrics_input.toPlainText()
+        similarity = self.similarity_spin.value()
+
+        try:
+            lyrics_lines = parse_lyrics_lines(raw_lyrics)
+            synced_segments = sync_segments_to_lyrics(self.segments, lyrics_lines, min_similarity=similarity)
+        except LyricSyncError as exc:
+            QMessageBox.warning(self, "Lyrics Sync", str(exc))
+            return
+
+        # Preserve original timeline duration and count; only replace text where sync succeeded.
+        for idx, synced in enumerate(synced_segments):
+            if idx >= len(self.segments):
+                break
+            self.segments[idx].text = synced.text
+
+        self._refresh_timeline_and_list(self.selected_segment)
+        QMessageBox.information(self, "Lyrics Synced", "Lyrics were synced to your current caption timeline.")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Offline AI Caption Studio - Desktop Caption Editor")
-    parser.add_argument("--video", type=Path, required=True, help="Path to source video file")
-    parser.add_argument("--srt", type=Path, required=True, help="Path to subtitle SRT file")
+    parser.add_argument("--video", type=Path, required=False, help="Path to source video file")
+    parser.add_argument("--srt", type=Path, required=False, help="Path to subtitle SRT file")
     return parser.parse_args()
+
+
+def _resolve_launch_video(args: argparse.Namespace) -> Path | None:
+    if args.video is not None:
+        return args.video.resolve()
+
+    path_str, _ = QFileDialog.getOpenFileName(
+        None,
+        "Select Video",
+        str(PROJECT_ROOT),
+        "Video Files (*.mp4 *.mov *.mkv *.avi *.m4v *.webm)",
+    )
+    if not path_str:
+        return None
+    return Path(path_str).resolve()
+
+
+def _resolve_launch_srt(video_path: Path, args: argparse.Namespace) -> Path | None:
+    if args.srt is not None:
+        return args.srt.resolve()
+
+    generated = OUTPUT_DIR / f"{video_path.stem}.srt"
+    if generated.exists():
+        return generated.resolve()
+
+    return None
 
 
 def run() -> None:
     args = parse_args()
 
-    if not args.video.exists():
-        raise SystemExit(f"Video file not found: {args.video}")
-    if not args.srt.exists():
-        raise SystemExit(f"SRT file not found: {args.srt}")
-
     app = QApplication(sys.argv)
+    app.setFont(QFont("Helvetica Neue"))
     backend_error = _validate_multimedia_backend()
     if backend_error is not None:
         QMessageBox.critical(None, "Qt Multimedia Backend Error", backend_error)
         raise SystemExit(backend_error)
 
-    window = CaptionEditorWindow(args.video.resolve(), args.srt.resolve())
+    video_path = _resolve_launch_video(args)
+    if video_path is None:
+        raise SystemExit("No video selected. Launch cancelled.")
+
+    if not video_path.exists():
+        raise SystemExit(f"Video file not found: {video_path}")
+
+    srt_path = _resolve_launch_srt(video_path, args)
+    if args.srt is not None and srt_path is not None and not srt_path.exists():
+        raise SystemExit(f"SRT file not found: {srt_path}")
+
+    window = CaptionEditorWindow(video_path, srt_path)
     window.show()
     sys.exit(app.exec())
 

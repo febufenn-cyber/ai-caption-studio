@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Bootstrap
+        run: python scripts/bootstrap.py --skip-ffmpeg
+
+      - name: Smoke CLI
+        if: runner.os != 'Windows'
+        run: |
+          ./.venv/bin/python -m backend.main --help
+          ./.venv/bin/python -m backend.ui.editor --help
+        shell: bash
+
+      - name: Smoke CLI (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          .\.venv\Scripts\python -m backend.main --help
+          .\.venv\Scripts\python -m backend.ui.editor --help

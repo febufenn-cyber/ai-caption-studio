@@ -19,16 +19,22 @@ choose_python() {
 }
 
 if ! PYTHON_BIN="$(choose_python)"; then
+  if command -v brew >/dev/null 2>&1; then
+    echo "Python 3.10+ not found. Installing python@3.11 via Homebrew..."
+    brew install python@3.11
+    if command -v python3.11 >/dev/null 2>&1; then
+      PYTHON_BIN="python3.11"
+    fi
+  fi
+fi
+
+if [ -z "${PYTHON_BIN:-}" ]; then
   echo "Python 3.10+ is required."
   echo "Install one first (macOS example): brew install python@3.11"
   exit 1
 fi
 
 echo "Using ${PYTHON_BIN}: $($PYTHON_BIN -V 2>&1)"
-
-"$PYTHON_BIN" -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install --upgrade --force-reinstall -r requirements.txt
+"$PYTHON_BIN" scripts/bootstrap.py
 
 echo "Environment ready. Activate with: source .venv/bin/activate"
