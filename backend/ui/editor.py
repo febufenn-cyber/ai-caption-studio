@@ -1,14 +1,51 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import os
 import subprocess
 import sys
 from pathlib import Path
 from typing import Callable
 
-from PyQt6.QtCore import QPointF, QRectF, Qt, QUrl, pyqtSignal
+def _resolve_pyqt_plugins_path() -> Path | None:
+    spec = importlib.util.find_spec("PyQt6")
+    if spec is None or spec.origin is None:
+        return None
+
+    plugins_path = Path(spec.origin).resolve().parent / "Qt6" / "plugins"
+    if plugins_path.exists():
+        return plugins_path
+    return None
+
+
+def _configure_qt_runtime_environment() -> None:
+    if sys.platform != "darwin":
+        return
+
+    # macOS native backend is more reliable than Qt's ffmpeg backend in venv installs.
+    os.environ.setdefault("QT_MEDIA_BACKEND", "darwin")
+
+    plugins_path = _resolve_pyqt_plugins_path()
+    if plugins_path is None:
+        return
+
+    existing = os.environ.get("QT_PLUGIN_PATH")
+    if not existing:
+        os.environ["QT_PLUGIN_PATH"] = str(plugins_path)
+        return
+
+    existing_paths = existing.split(os.pathsep)
+    if str(plugins_path) not in existing_paths:
+        os.environ["QT_PLUGIN_PATH"] = os.pathsep.join([str(plugins_path), existing])
+
+
+_configure_qt_runtime_environment()
+
+
+from PyQt6.QtCore import QLibraryInfo, QPointF, QRectF, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction, QBrush, QColor, QPen
-from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PyQt6.QtMultimedia import QAudioOutput, QMediaFormat, QMediaPlayer
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtWidgets import (
     QApplication,
@@ -33,13 +70,47 @@ from PyQt6.QtWidgets import (
 from backend.subtitles.ass_writer import write_ass
 from backend.subtitles.srt_parser import parse_srt_file
 from backend.subtitles.srt_writer import write_srt
-from backend.transcription.whisper_engine import CaptionSegment
+from backend.caption_segment import CaptionSegment
 from backend.video.extractor import AudioExtractionError, ensure_ffmpeg_available
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 OUTPUT_DIR = PROJECT_ROOT / "output"
 TEMP_DIR = PROJECT_ROOT / "temp"
+
+
+def _multimedia_troubleshooting_message(error_detail: str | None = None) -> str:
+    lines = []
+    if error_detail:
+        lines.append(error_detail)
+    lines.extend(
+        [
+            "QtMultimedia backend failed to initialize.",
+            f"QT_MEDIA_BACKEND={os.environ.get('QT_MEDIA_BACKEND', '(unset)')}",
+            f"QT_PLUGIN_PATH={os.environ.get('QT_PLUGIN_PATH', '(unset)')}",
+            f"Qt plugins path={QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath)}",
+            "",
+            "Recommended fixes:",
+            "1) Recreate the venv with Python 3.10+ using ./scripts/setup.sh",
+            "2) Remove conflicting shell vars: QT_PLUGIN_PATH and QT_QPA_PLATFORM_PLUGIN_PATH",
+            "3) On macOS, use the native backend: export QT_MEDIA_BACKEND=darwin",
+            "4) If you force ffmpeg backend, install matching FFmpeg 7 libraries: brew install ffmpeg@7",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _validate_multimedia_backend() -> str | None:
+    try:
+        decode_formats = QMediaFormat().supportedFileFormats(QMediaFormat.ConversionMode.Decode)
+    except Exception as exc:  # noqa: BLE001 - surface Qt runtime failures to the user
+        return _multimedia_troubleshooting_message(f"QtMultimedia probe error: {exc}")
+
+    if decode_formats:
+        return None
+
+    return _multimedia_troubleshooting_message()
+
 
 def _escape_subtitle_filter_path(path: Path) -> str:
     value = path.as_posix()
@@ -198,6 +269,7 @@ class CaptionEditorWindow(QMainWindow):
         self.srt_path = srt_path
         self.segments = parse_srt_file(self.srt_path)
         self.selected_segment: CaptionSegment | None = None
+        self._playback_error_reported = False
 
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         TEMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -255,6 +327,7 @@ class CaptionEditorWindow(QMainWindow):
         self.setCentralWidget(body)
 
         self.media_player.positionChanged.connect(self._update_position_label)
+        self.media_player.errorOccurred.connect(self._on_media_error)
 
         open_action = QAction("Open SRT", self)
         open_action.triggered.connect(self.open_srt)
@@ -284,6 +357,18 @@ class CaptionEditorWindow(QMainWindow):
     def on_segment_edited(self, segment: CaptionSegment) -> None:
         self.selected_segment = segment
         self._update_range_label(segment)
+
+    def _on_media_error(self, error: QMediaPlayer.Error, error_string: str) -> None:
+        if error == QMediaPlayer.Error.NoError or self._playback_error_reported:
+            return
+        self._playback_error_reported = True
+
+        detail = error_string.strip() if error_string else "Unknown media playback error."
+        QMessageBox.critical(
+            self,
+            "Playback Error",
+            _multimedia_troubleshooting_message(detail),
+        )
 
     def save_srt(self) -> None:
         write_srt(self.segments, self.srt_path)
@@ -414,6 +499,11 @@ def run() -> None:
         raise SystemExit(f"SRT file not found: {args.srt}")
 
     app = QApplication(sys.argv)
+    backend_error = _validate_multimedia_backend()
+    if backend_error is not None:
+        QMessageBox.critical(None, "Qt Multimedia Backend Error", backend_error)
+        raise SystemExit(backend_error)
+
     window = CaptionEditorWindow(args.video.resolve(), args.srt.resolve())
     window.show()
     sys.exit(app.exec())

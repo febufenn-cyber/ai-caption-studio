@@ -28,6 +28,7 @@ Offline AI Caption Studio is a local-first Python application that generates sub
 
 - Python 3.10+
 - FFmpeg installed and available on `PATH`
+- macOS users: use native (non-Rosetta) terminal + Python matching your machine architecture
 
 FFmpeg install examples:
 - Ubuntu/Debian: `sudo apt-get update && sudo apt-get install -y ffmpeg`
@@ -43,9 +44,10 @@ Run once from the repository root:
 ```
 
 This setup script:
-1. Creates a virtual environment at `.venv`
-2. Upgrades `pip`
-3. Installs dependencies from `requirements.txt`
+1. Selects Python 3.10+ (`python3.12`, `python3.11`, `python3.10`, then `python3`)
+2. Creates a virtual environment at `.venv`
+3. Upgrades `pip`
+4. Reinstalls dependencies from `requirements.txt` for a clean Qt runtime
 
 ## Run (single command)
 
@@ -113,8 +115,38 @@ source .venv/bin/activate
 python -m backend.ui.editor --video /path/to/video.mp4 --srt /path/to/captions.srt
 ```
 
+On macOS, the editor now defaults to Qt's native media backend (`QT_MEDIA_BACKEND=darwin`) for reliable playback.
+
 Tip:
 - First generate captions with `python -m backend.main <video_file>` and then open the produced `/output/<video_stem>.srt` in the editor.
+
+### macOS playback troubleshooting
+
+If the editor opens but video is blank and logs include `No QtMultimedia backends found`:
+
+1. Recreate environment:
+   ```bash
+   rm -rf .venv
+   ./scripts/setup.sh
+   ```
+2. Ensure shell does not override Qt plugin paths:
+   ```bash
+   unset QT_PLUGIN_PATH
+   unset QT_QPA_PLATFORM_PLUGIN_PATH
+   ```
+3. Run the editor with the native backend explicitly:
+   ```bash
+   QT_MEDIA_BACKEND=darwin python -m backend.ui.editor --video /path/to/video.mp4 --srt /path/to/captions.srt
+   ```
+4. If you force `QT_MEDIA_BACKEND=ffmpeg`, install matching FFmpeg 7 libs:
+   ```bash
+   brew install ffmpeg@7
+   ```
+
+Notes:
+- Homebrew `ffmpeg` command availability is separate from QtMultimedia backend loading.
+- `OpenType support missing for .AppleSystemUIFont` is a font warning and not the cause of backend failure.
+- `urllib3` `NotOpenSSLWarning` means your venv is using system Python 3.9 (`LibreSSL`). Recreate `.venv` with Python 3.10+ via `./scripts/setup.sh`.
 
 
 ### Export captioned video

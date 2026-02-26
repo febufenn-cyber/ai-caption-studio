@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from backend.transcription.whisper_engine import CaptionSegment
+from backend.caption_segment import CaptionSegment
 
 _TIME_RE = re.compile(
     r"(?P<h>\d{2}):(?P<m>\d{2}):(?P<s>\d{2}),(?P<ms>\d{3})"

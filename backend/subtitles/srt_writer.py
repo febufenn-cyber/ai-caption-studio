@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable
 
-from backend.transcription.whisper_engine import CaptionSegment
+from backend.caption_segment import CaptionSegment
 
 
 def _to_srt_time(seconds: float) -> str:

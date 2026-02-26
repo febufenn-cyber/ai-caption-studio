@@ -4,7 +4,7 @@ import re
 from difflib import SequenceMatcher
 from typing import Iterable
 
-from backend.transcription.whisper_engine import CaptionSegment
+from backend.caption_segment import CaptionSegment
 
 
 class LyricSyncError(RuntimeError):

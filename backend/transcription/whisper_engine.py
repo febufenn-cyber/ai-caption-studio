@@ -1,17 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
 from faster_whisper import WhisperModel
 
-
-@dataclass
-class CaptionSegment:
-    start: float
-    end: float
-    text: str
+from backend.caption_segment import CaptionSegment
 
 
 class TranscriptionError(RuntimeError):
