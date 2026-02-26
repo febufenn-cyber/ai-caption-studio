@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -71,7 +72,6 @@ from backend.subtitles.ass_writer import write_ass
 from backend.subtitles.srt_parser import parse_srt_file
 from backend.subtitles.srt_writer import write_srt
 from backend.caption_segment import CaptionSegment
-from backend.video.extractor import AudioExtractionError, ensure_ffmpeg_available
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -117,7 +117,80 @@ def _escape_subtitle_filter_path(path: Path) -> str:
     value = value.replace("\\", r"\\")
     value = value.replace(":", r"\:")
     value = value.replace("'", r"\'")
+    value = value.replace(" ", r"\ ")
+    value = value.replace("[", r"\[")
+    value = value.replace("]", r"\]")
+    value = value.replace(",", r"\,")
     return value
+
+
+def _ffmpeg_has_subtitles_filter(ffmpeg_bin: str) -> bool:
+    try:
+        result = subprocess.run(
+            [ffmpeg_bin, "-hide_banner", "-filters"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return False
+
+    output = f"{result.stdout}\n{result.stderr}"
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "subtitles":
+            return True
+    return False
+
+
+def _candidate_ffmpeg_bins() -> list[Path]:
+    candidates: list[Path] = []
+
+    ffmpeg_env = os.environ.get("FFMPEG_BIN")
+    if ffmpeg_env:
+        candidates.append(Path(ffmpeg_env).expanduser())
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path:
+        candidates.append(Path(ffmpeg_path))
+
+    if sys.platform == "darwin":
+        candidates.append(Path("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"))
+        candidates.append(Path("/usr/local/opt/ffmpeg-full/bin/ffmpeg"))
+
+    unique_existing: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        resolved = str(path)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if path.exists():
+            unique_existing.append(path)
+    return unique_existing
+
+
+def _resolve_ffmpeg_for_subtitle_burnin() -> tuple[str | None, str | None]:
+    candidates = _candidate_ffmpeg_bins()
+    if not candidates:
+        return None, "FFmpeg binary not found. Install FFmpeg and ensure it is on PATH."
+
+    for candidate in candidates:
+        ffmpeg_bin = str(candidate)
+        if _ffmpeg_has_subtitles_filter(ffmpeg_bin):
+            return ffmpeg_bin, None
+
+    detected = str(candidates[0])
+    message = (
+        "Your FFmpeg build does not include the 'subtitles' filter (libass), "
+        "so burned-in caption export cannot run.\n\n"
+        f"Detected FFmpeg: {detected}\n\n"
+        "Fix on macOS:\n"
+        "1) brew install ffmpeg-full\n"
+        "2) export FFMPEG_BIN=/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg\n"
+        "   (or prepend /opt/homebrew/opt/ffmpeg-full/bin to PATH)\n"
+    )
+    return None, message
 
 
 class EditableCaptionTextItem(QGraphicsTextItem):
@@ -409,10 +482,9 @@ class CaptionEditorWindow(QMainWindow):
         return max(0.0, min(100.0, (out_time_ms / 1_000_000) / duration * 100))
 
     def export_captioned_video(self) -> None:
-        try:
-            ensure_ffmpeg_available()
-        except AudioExtractionError as exc:
-            QMessageBox.critical(self, "FFmpeg Missing", str(exc))
+        ffmpeg_bin, ffmpeg_error = _resolve_ffmpeg_for_subtitle_burnin()
+        if ffmpeg_error is not None:
+            QMessageBox.critical(self, "FFmpeg Subtitle Filter Missing", ffmpeg_error)
             return
 
         fmt = self.format_combo.currentText().strip().lower()
@@ -420,9 +492,9 @@ class CaptionEditorWindow(QMainWindow):
         output_video_path = OUTPUT_DIR / f"{self.video_path.stem}_captioned_{fmt}.mp4"
         progress_file = TEMP_DIR / "ffmpeg_export_progress.txt"
 
-        subtitle_filter = f"subtitles={_escape_subtitle_filter_path(subtitle_path)}"
+        subtitle_filter = f"subtitles=filename={_escape_subtitle_filter_path(subtitle_path)}"
         command = [
-            "ffmpeg",
+            ffmpeg_bin,
             "-y",
             "-i",
             str(self.video_path),

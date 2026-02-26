@@ -29,10 +29,12 @@ Offline AI Caption Studio is a local-first Python application that generates sub
 - Python 3.10+
 - FFmpeg installed and available on `PATH`
 - macOS users: use native (non-Rosetta) terminal + Python matching your machine architecture
+- Burned subtitle export requires FFmpeg with `subtitles` filter (`libass`) support. On Homebrew, install `ffmpeg-full`.
 
 FFmpeg install examples:
 - Ubuntu/Debian: `sudo apt-get update && sudo apt-get install -y ffmpeg`
-- macOS (Homebrew): `brew install ffmpeg`
+- macOS (Homebrew, basic): `brew install ffmpeg` (transcription/extraction)
+- macOS (Homebrew, required for burned subtitle export): `brew install ffmpeg-full`
 - Windows (winget): `winget install Gyan.FFmpeg`
 
 ## Setup
@@ -141,6 +143,11 @@ If the editor opens but video is blank and logs include `No QtMultimedia backend
 4. If you force `QT_MEDIA_BACKEND=ffmpeg`, install matching FFmpeg 7 libs:
    ```bash
    brew install ffmpeg@7
+   ```
+5. If export fails with `No such filter: 'subtitles'`, use ffmpeg-full:
+   ```bash
+   brew install ffmpeg-full
+   export FFMPEG_BIN=/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg
    ```
 
 Notes:
